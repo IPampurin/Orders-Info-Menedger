@@ -1,23 +1,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"os/signal"
+	"syscall"
 
 	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/cache"
 	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/db"
 	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/server"
-	"github.com/joho/godotenv"
 )
 
 func main() {
 
 	var err error
-
-	// загружаем переменные окружения
-	err = godotenv.Load()
-	if err != nil {
-		fmt.Printf("ошибка загрузки .env файла: %v\n", err)
-	}
 
 	// подключаем базу данных
 	err = db.ConnectDB()
@@ -33,10 +30,15 @@ func main() {
 		fmt.Printf("кэш отвалился, ошибка вызова cache.InitRedis: %v\n", err)
 	}
 
-	// запускаем сервер
-	err = server.Run()
-	if err != nil {
-		fmt.Printf("ошибка запуска сервера: %v\n", err)
+	// создаем контекст для сигналов отмены
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// запускаем сервер и ждем его завершения
+	if err := server.Run(ctx); err != nil {
+		log.Printf("Ошибка сервера: %v\n", err)
 		return
 	}
+
+	log.Println("Приложение корректно завершено")
 }

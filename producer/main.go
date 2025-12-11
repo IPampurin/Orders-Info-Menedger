@@ -6,281 +6,335 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
+	"os/signal"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
-	"unicode"
 
+	"github.com/brianvoe/gofakeit/v7"
 	"github.com/segmentio/kafka-go"
 )
 
-var (
-	topic        = "my-topic-L0" // имя топика, в который пишем сообщения
-	countMessage = 10            // количество тестовых джасончиков
+// выносим константы конфигурации по умолчанию, чтобы были на виду
+
+const (
+	topicNameConst     = "my-topic" // имя топика, коррелируется с консумером
+	kafkaPortConst     = 9092       // порт, на котором сидит kafka по умолчанию
+	massagesCountConst = 10         // количество сообщений, отправляемых одним врайтером, по умолчанию
+	writersCountConst  = 500        // количество врайтеров для имитации отправки "со всех сторон", по умолчанию
 )
+
+// ProducerConfig описывает настройки с учётом переменных окружения
+type ProducerConfig struct {
+	Topic         string // имя топика (коррелируется с консумером)
+	KafkaPort     int    // порт, на котором сидит kafka
+	MassagesCount int    // количество сообщений, отправляемых одним врайтером
+	WritersCount  int    // количество врайтеров
+}
+
+var cfg *ProducerConfig
+
+// getEnvString проверяет наличие и корректность переменной окружения (строковое значение)
+func getEnvString(envVariable, defaultValue string) string {
+
+	value, ok := os.LookupEnv(envVariable)
+	if ok {
+		return value
+	}
+
+	return defaultValue
+}
+
+// getEnvInt проверяет наличие и корректность переменной окружения (числовое значение)
+func getEnvInt(envVariable string, defaultValue int) int {
+
+	value, ok := os.LookupEnv(envVariable)
+	if ok {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+		log.Printf("ошибка парсинга %s, используем значение по умолчанию: %d", envVariable, defaultValue)
+	}
+
+	return defaultValue
+}
+
+// readConfig уточняет конфигурацию с учётом переменных окружения,
+// проверяет переменные окружения и устанавливает параметры работы
+func readConfig() *ProducerConfig {
+
+	return &ProducerConfig{
+		Topic:         getEnvString("TOPIC_NAME_STR", topicNameConst),
+		KafkaPort:     getEnvInt("KAFKA_PORT_NUM", kafkaPortConst),
+		MassagesCount: getEnvInt("MESSAGES_COUNT", massagesCountConst),
+		WritersCount:  getEnvInt("WRITERS_COUNT", writersCountConst),
+	}
+}
+
+// sendMessages генерирует и отправляет брокеру заданное количество сообщений
+func sendMessages(ctx context.Context, w *kafka.Writer, generatedCount, countSended, failedCount *int64, wg *sync.WaitGroup) {
+
+	defer wg.Done()
+
+	// генерируем сообщения для отправки
+	messages := messageGenerate(cfg.MassagesCount)
+	if len(messages) == 0 {
+		log.Println("Не сгенерировано ни одного сообщения для отправки.")
+		return
+	}
+
+	atomic.AddInt64(generatedCount, int64(len(messages)))
+
+	// отправляем сообщения с проверкой контекста
+	for i, msgBody := range messages {
+
+		select {
+		default:
+			msg := kafka.Message{
+				Key:   []byte(fmt.Sprintf("Сообщение №%d", i+1)),
+				Value: msgBody,
+				Time:  time.Now(),
+			}
+
+			err := w.WriteMessages(context.Background(), msg)
+			if err != nil {
+				atomic.AddInt64(failedCount, 1)
+			} else {
+				atomic.AddInt64(countSended, 1)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
 
 func main() {
 
+	// инициализируем генератор gofakeit
+	gofakeit.Seed(0)
+
+	// считываем конфигурацию
+	cfg = readConfig()
+
 	// устанавливаем соединение с брокером
-	conn, err := kafka.DialLeader(context.Background(), "tcp", "localhost:9092", topic, 0)
+	conn, err := kafka.DialLeader(context.Background(), "tcp", fmt.Sprintf("localhost:%d", cfg.KafkaPort), cfg.Topic, 0)
 	if err != nil {
 		log.Fatalf("ошибка создания топика кафки: %v\n", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Ошибка при закрытии продюсером соединения с  кафкой: %v", err)
+		}
+	}()
 
 	log.Println("Соединение с брокером установлено.")
 
-	// определяем продюсер
-	w := kafka.NewWriter(kafka.WriterConfig{
-		Brokers: []string{"localhost:9092"}, // список брокеров
-		Topic:   topic,                      // имя топика, в который будем слать сообщения
-		// RequiredAcks: kafka.WaitForLocal	// по умолчанию лидер в кафке подтверждает получение сообщения
-	})
-	defer w.Close()
-
-	log.Println("Начинаем генерировать тестовые данные.")
-
-	// собираем и отправляем тестовые сообщения
-	messages := messageGenerate(countMessage)
-
-	log.Println("Начинаем отправку тестовых данных.")
-
-	for i, msgBody := range messages {
-		msg := kafka.Message{
-			Key:   []byte(fmt.Sprintf("Сообщение №%d", i+1)),
-			Value: msgBody,
-			Time:  time.Now(),
+	// создаём ряд врайтеров
+	writers := make([]*kafka.Writer, cfg.WritersCount)
+	for i := 0; i < len(writers); i++ {
+		// определяем продюсер
+		writers[i] = &kafka.Writer{
+			Addr:         kafka.TCP(fmt.Sprintf("localhost:%d", cfg.KafkaPort)), // список брокеров
+			Topic:        cfg.Topic,                                             // имя топика, в который будем слать сообщения
+			Async:        false,                                                 // можно установить true и получить максимальную скорость без гарантии доставки
+			RequiredAcks: kafka.RequireAll,                                      // максимальный контроль доставки (подтверждение от всех реплик)
 		}
-
-		// отправляем сообщения (по дефолту лидер в кафке подтверждает получение сообщения)
-		err := w.WriteMessages(context.Background(), msg)
-		if err != nil {
-			log.Printf("ошибка отправления сообщения в кафку '%s': %v\n", msgBody, err)
-		} else {
-			fmt.Printf("Отправленное в кафку сообщение: %s\n", string(msgBody))
-		}
+		defer func() {
+			if err := writers[i].Close(); err != nil {
+				log.Printf("Ошибка при закрытии продюсера: %v", err)
+			}
+		}()
 	}
 
-	log.Println("Продюсер отправил тестовые сообщения.")
+	// организуем контекст для корректного завершения писателей
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// подготавливаем обработку сигналов ОС
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// фоном слушаем сигналы отмены и отменяем контекст
+	go func() {
+		<-sigChan
+		log.Println("Получен сигнал остановки, завершаем отправку...")
+		cancel()
+	}()
+
+	var generatedCount int64 // количество сгенерированных сообщений
+	var countSended int64    // количество отправленных сообщений
+	var failedCount int64    // количество ошибок при отправке сообщений
+
+	log.Printf("Запускаем %d врайтеров.\n", len(writers))
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < len(writers); i++ {
+		wg.Add(1)
+		go sendMessages(ctx, writers[i], &generatedCount, &countSended, &failedCount, &wg)
+	}
+
+	wg.Wait()
+
+	log.Println("Врайтеры завершили отправку сообщений брокеру.")
+
+	log.Printf("Сгенерировано сообщений: %d. Отправлено брокеру сообщений: %d. Ошибок при отправке: %d.\n", generatedCount, countSended, failedCount)
 }
 
 // Заказ
 type Order struct {
-	OrderUID          string    `json:"order_uid" gorm:"unique_index;not null"`
-	TrackNumber       string    `json:"track_number" gorm:"index"`
+	OrderUID          string    `json:"order_uid"`
+	TrackNumber       string    `json:"track_number"`
 	Entry             string    `json:"entry"`
-	Delivery          *Delivery `json:"delivery" gorm:"foreignKey:OrderID"`
-	Payment           *Payment  `json:"payment" gorm:"foreignKey:OrderID"`
-	Items             []*Item   `json:"items" gorm:"foreignKey:OrderID"`
+	Delivery          Delivery  `json:"delivery"`
+	Payment           Payment   `json:"payment"`
+	Items             []Item    `json:"items"`
 	Locale            string    `json:"locale"`
 	InternalSignature string    `json:"internal_signature"`
 	CustomerID        string    `json:"customer_id"`
 	DeliveryService   string    `json:"delivery_service"`
 	Shardkey          string    `json:"shardkey"`
-	SMID              int       `json:"sm_id" gorm:"type:smallint"`
-	DateCreated       time.Time `json:"date_created" gorm:"type:timestamp;default:CURRENT_TIMESTAMP"`
+	SMID              int       `json:"sm_id"`
+	DateCreated       time.Time `json:"date_created"`
 	OOFShard          string    `json:"oof_shard"`
 }
 
 // Доставка
 type Delivery struct {
-	OrderID uint   `json:"-"`
-	Name    string `json:"name" gorm:"size:100"`
-	Phone   string `json:"phone" gorm:"size:20"`
-	Zip     string `json:"zip" gorm:"size:20"`
-	City    string `json:"city" gorm:"size:100"`
-	Address string `json:"address" gorm:"size:255"`
-	Region  string `json:"region" gorm:"size:100"`
-	Email   string `json:"email" gorm:"unique_index;type:varchar(100)"`
+	Name    string `json:"name"`
+	Phone   string `json:"phone"`
+	Zip     string `json:"zip"`
+	City    string `json:"city"`
+	Address string `json:"address"`
+	Region  string `json:"region"`
+	Email   string `json:"email"`
 }
 
 // Оплата
 type Payment struct {
-	OrderID      uint    `json:"-"`
-	Transaction  string  `json:"transaction" gorm:"unique_index"`
+	Transaction  string  `json:"transaction"`
 	RequestID    string  `json:"request_id"`
-	Currency     string  `json:"currency" gorm:"size:3"`
-	Provider     string  `json:"provider" gorm:"size:50"`
-	Amount       float64 `json:"amount" gorm:"type:decimal(10,2)"`
-	PaymentDT    int64   `json:"payment_dt" gorm:"type:bigint"`
-	Bank         string  `json:"bank" gorm:"size:50"`
-	DeliveryCost float64 `json:"delivery_cost" gorm:"type:decimal(10,2)"`
-	GoodsTotal   float64 `json:"goods_total" gorm:"type:decimal(10,2)"`
-	CustomFee    float64 `json:"custom_fee" gorm:"type:decimal(10,2)"`
+	Currency     string  `json:"currency"`
+	Provider     string  `json:"provider"`
+	Amount       float64 `json:"amount"`
+	PaymentDT    int64   `json:"payment_dt"`
+	Bank         string  `json:"bank"`
+	DeliveryCost float64 `json:"delivery_cost"`
+	GoodsTotal   float64 `json:"goods_total"`
+	CustomFee    float64 `json:"custom_fee"`
 }
 
 // Позиция заказа
 type Item struct {
-	OrderID     uint    `json:"-"`
-	ChrtID      int     `json:"chrt_id" gorm:"type:integer"`
+	ChrtID      int     `json:"chrt_id"`
 	TrackNumber string  `json:"track_number"`
-	Price       float64 `json:"price" gorm:"type:decimal(10,2)"`
-	RID         string  `json:"rid" gorm:"size:100"`
-	Name        string  `json:"name" gorm:"size:255"`
-	Sale        float64 `json:"sale" gorm:"type:decimal(5,2)"`
-	Size        string  `json:"size" gorm:"size:20"`
-	TotalPrice  float64 `json:"total_price" gorm:"type:decimal(10,2)"`
-	NMID        int     `json:"nm_id" gorm:"type:integer"`
-	Brand       string  `json:"brand" gorm:"size:100"`
-	Status      int     `json:"status" gorm:"type:smallint"`
+	Price       float64 `json:"price"`
+	RID         string  `json:"rid"`
+	Name        string  `json:"name"`
+	Sale        float64 `json:"sale"`
+	Size        string  `json:"size"`
+	TotalPrice  float64 `json:"total_price"`
+	NMID        int     `json:"nm_id"`
+	Brand       string  `json:"brand"`
+	Status      int     `json:"status"`
 }
 
-// createDelivery выдаёт указатель на экземляр структуры Delivery
-func createDelivery() *Delivery {
-
-	delivery := &Delivery{
-		Name:    generateWord() + " " + generateWord(),                                         // string
-		Phone:   generatePhone(),                                                               // string
-		Zip:     strconv.Itoa(int(generateNumber(2639809))),                                    // string
-		City:    generateWord() + " " + generateWord(),                                         // string
-		Address: generateWord() + " " + generateWord() + strconv.Itoa(int(generateNumber(15))), // string
-		Region:  generateWord(),                                                                // string
-		Email:   generateWord() + "@gmail.com",                                                 // string
+// createDelivery выдаёт экземляр структуры Delivery
+func createDelivery() Delivery {
+	return Delivery{
+		Name:    gofakeit.Name(),
+		Phone:   gofakeit.Phone(),
+		Zip:     gofakeit.Zip(),
+		City:    gofakeit.City(),
+		Address: gofakeit.Street() + ", " + gofakeit.StreetNumber(),
+		Region:  gofakeit.State(),
+		Email:   gofakeit.Email(),
 	}
-
-	return delivery
 }
 
-// createPayment выдаёт указатель на экземляр структуры Payment
-func createPayment() *Payment {
+// createPayment выдаёт экземляр структуры Payment
+func createPayment() Payment {
+	goodsTotal := gofakeit.Price(100, 10000)
+	deliveryCost := gofakeit.Price(0, 500)
 
-	goodsTotal := generateNumber(317)    // придумываем цену
-	deliveryCost := generateNumber(1500) // придумываем цену доставки
+	daysAgo := gofakeit.Number(1, 30)
+	hoursAgo := gofakeit.Number(1, 24)
+	paymentTime := time.Now().Add(-time.Duration(daysAgo)*24*time.Hour - time.Duration(hoursAgo)*time.Hour)
 
-	payment := &Payment{
-		Transaction:  generateRid(),                     // string
-		RequestID:    "",                                // string
-		Currency:     "USD",                             // string
-		Provider:     "wbpay",                           // string
-		Amount:       deliveryCost + goodsTotal,         // float64
-		PaymentDT:    int64(generateNumber(1637907727)), // int64
-		Bank:         "alpha",                           // string
-		DeliveryCost: deliveryCost,                      // float64
-		GoodsTotal:   goodsTotal,                        // float64
-		CustomFee:    0,                                 // float64
+	return Payment{
+		Transaction:  gofakeit.UUID(),
+		RequestID:    gofakeit.UUID(),
+		Currency:     gofakeit.CurrencyShort(),
+		Provider:     gofakeit.RandomString([]string{"wbpay", "stripe", "paypal"}),
+		Amount:       goodsTotal + deliveryCost,
+		PaymentDT:    paymentTime.Unix(),
+		Bank:         gofakeit.RandomString([]string{"alpha", "sber", "tinkoff", "vtb"}),
+		DeliveryCost: deliveryCost,
+		GoodsTotal:   goodsTotal,
+		CustomFee:    gofakeit.Price(0, 100),
 	}
-
-	return payment
 }
 
-// createItem выдаёт указатель на экземляр структуры Item
-func createItem() *Item {
+// createItem выдаёт экземляр структуры Item
+func createItem() Item {
 
-	price := generateNumber(10000)  // придумываем цену
-	sale := generateNumber(100)     // придумываем скидку
-	size := int(generateNumber(60)) // придумываем размер
+	price := gofakeit.Price(10, 1000)
+	sale := gofakeit.Float64Range(0, 50)
 
-	item := &Item{
-		ChrtID:      int(generateNumber(9934930)),          // int
-		TrackNumber: "WBILMTESTTRACK",                      // const
-		Price:       price,                                 // float64
-		RID:         generateRid(),                         // string
-		Name:        generateWord(),                        // string
-		Sale:        sale,                                  // float64
-		Size:        strconv.Itoa(size),                    // string
-		TotalPrice:  price * (1 - (sale / 100)),            // float64
-		NMID:        int(generateNumber(2389212)),          // int
-		Brand:       generateWord() + " " + generateWord(), // string
-		Status:      202,                                   // int
+	return Item{
+		ChrtID:      gofakeit.Number(1000000, 9999999),
+		TrackNumber: "WBILMTESTTRACK",
+		Price:       price,
+		RID:         gofakeit.UUID(),
+		Name:        gofakeit.ProductName(),
+		Sale:        sale,
+		Size:        gofakeit.RandomString([]string{"S", "M", "L", "XL"}),
+		TotalPrice:  price * (1 - sale/100),
+		NMID:        gofakeit.Number(1000000, 9999999),
+		Brand:       gofakeit.Company(),
+		Status:      gofakeit.Number(200, 204),
 	}
-
-	return item
-}
-
-// generateNumber генерирует случайное число в диапазоне [0, max)
-func generateNumber(max int) float64 {
-
-	return float64(rand.Float64() * float64(max))
-}
-
-// generateWord генерирует слово на латинице с заглавной буквы длиной от 4 до 10 букв
-func generateWord() string {
-
-	letters := "abcdefghijklmnopqrstuvwxyz" // набор возможных букв для генерации слова
-
-	length := rand.Intn(7) + 4 // генерируем случайную длину слова от 4 до 10 букв
-
-	word := make([]rune, 0, 10)
-
-	// заполняем слово случайными буквами
-	for i := 0; i < length; i++ {
-		randomIndex := rand.Intn(len(letters))
-		randomLetter := rune(letters[randomIndex])
-		if i == 0 {
-			randomLetter = unicode.ToUpper(randomLetter) // если буква первая, меняем регистр
-		}
-		word = append(word, randomLetter)
-	}
-
-	return string(word)
-}
-
-// generateRid генерирует строку в формате "случайная_часть + слово"
-func generateRid() string {
-
-	letters := "abcdefghijklmnopqrstuvwxyz0123456789" // набор возможных символов для случайной части
-
-	randomPartLength := 19 // фиксированная длина случайной части
-
-	fixedWord := "test" // суфикс
-
-	randomPart := make([]rune, 0, randomPartLength)
-
-	// генерируем случайную часть
-	for i := 0; i < randomPartLength; i++ {
-		randomIndex := rand.Intn(len(letters))
-		randomLetter := rune(letters[randomIndex])
-		randomPart = append(randomPart, randomLetter)
-	}
-
-	return string(randomPart) + fixedWord
-}
-
-// generatePhone генерирует номер телефона в формате "+ХХХХХХХХХХ"
-func generatePhone() string {
-
-	number := make([]byte, 10, 10)
-
-	for i := 0; i < 10; i++ {
-		digit := rand.Intn(10)        // генерируем цифру от 0 до 9
-		number[i] = byte(digit) + '0' // преобразуем цифру в байт
-	}
-
-	return "+" + string(number)
 }
 
 // messageGenerate организует псевдослучайные данные для передачи брокеру
 func messageGenerate(count int) [][]byte {
 
-	testMsg := make([][]byte, count, count)
+	testMsg := make([][]byte, count)
 
-	var order *Order
-
-	for i := 0; i < len(testMsg); i++ {
-
+	for i := 0; i < count; i++ {
 		delivery := createDelivery()
 		payment := createPayment()
-		item := createItem()
+		items := []Item{createItem()}
 
-		order = &Order{
-			OrderUID:          payment.Transaction,        // string
-			TrackNumber:       "WBILMTESTTRACK",           // string
-			Entry:             "WBIL",                     // string
-			Delivery:          delivery,                   // Delivery
-			Payment:           payment,                    // Payment
-			Items:             []*Item{item},              // []Item. Возьмём один единственный товар, чтобы не заморачиваться
-			Locale:            "en",                       // string
-			InternalSignature: "",                         // string
-			CustomerID:        "test",                     // string
-			DeliveryService:   "meest",                    // string
-			Shardkey:          strconv.Itoa(rand.Intn(9)), // string
-			SMID:              rand.Intn(99),              // int
-			DateCreated:       time.Now().UTC(),           // time.Time
-			OOFShard:          strconv.Itoa(rand.Intn(5)), // string
+		// Иногда добавляем несколько товаров
+		if rand.Intn(2) == 0 {
+			items = append(items, createItem())
 		}
 
-		orderInByte, err := json.Marshal(order) // превращаем экземпляр order в []byte
+		order := Order{
+			OrderUID:          payment.Transaction,
+			TrackNumber:       "WBILMTESTTRACK",
+			Entry:             "WBIL",
+			Delivery:          delivery,
+			Payment:           payment,
+			Items:             items,
+			Locale:            gofakeit.RandomString([]string{"en", "ru"}),
+			InternalSignature: "",
+			CustomerID:        gofakeit.UUID(),
+			DeliveryService:   gofakeit.RandomString([]string{"meest", "cdek", "dhl", "ups"}),
+			Shardkey:          fmt.Sprintf("%d", gofakeit.Number(0, 9)),
+			SMID:              gofakeit.Number(1, 99),
+			DateCreated:       time.Unix(payment.PaymentDT, 0),
+			OOFShard:          fmt.Sprintf("%d", gofakeit.Number(0, 5)),
+		}
+
+		orderInByte, err := json.Marshal(order)
 		if err != nil {
-			continue // тут ошибка нам не интересна - просто пропустим досадную неожиданность
+			log.Printf("Ошибка маршалинга заказа: %v", err)
+			continue
 		}
 
 		testMsg[i] = orderInByte

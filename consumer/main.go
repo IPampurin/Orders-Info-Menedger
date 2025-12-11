@@ -3,110 +3,624 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
 
-var (
-	topic   = "my-topic-L0" // имя топика коррелируется с продюсером
-	groupID = "my-groupID"  // произвольное в нашем случае имя группы
+// выносим константы конфигурации по умолчанию, чтобы были на виду.
+// для работы программы менять в .env
+const (
+	topicNameConst       = "my-topic"     // имя топика, коррелируется с продюсером
+	groupIDNameConst     = "my-groupID"   // произвольное в нашем случае имя группы
+	kafkaPortConst       = 9092           // порт, на котором сидит kafka по умолчанию
+	limitConsumWorkConst = 10800          // время работы консумера по умолчанию в секундах (3 часа)
+	servicePortConst     = 8081           // порт принимающего api-сервиса по умолчанию
+	batchSizeConst       = 200            // количество сообщений в батче по умолчанию
+	batchTimeoutMsConst  = 3000           // время наполнения батча по умолчанию, мс
+	maxRetriesConst      = 3              // количество повторных попыток отправки батчей в api по умолчанию
+	retryDelayBaseConst  = 100            // базовая задержка для попыток отправки по умолчанию
+	clientTimeoutConst   = 10             // таймаут для HTTP клиента по умолчанию
+	dlqTopicConst        = "my-topic-DLQ" // топик для DLQ
+	workersCountConst    = 5              // количество параллельных обработчиков в пайплайне
 )
 
-// consumer это основной код консумера
-func consumer(ctx context.Context) {
+// OrderResponse структура для ответов из api (копия из postOrders.go)
+type OrderResponse struct {
+	OrderUID     string `json:"order_uid"`         // идентификатор сообщения
+	Status       string `json:"status"`            // статус: "success", "conflict", "badRequest", "error"
+	Message      string `json:"message,omitempty"` // информация об ошибке
+	ShouldCommit bool   `json:"shouldCommit"`      // можно ли коммитить в кафке
+	ShouldDLQ    bool   `json:"shouldDLQ"`         // надо ли отправить в DLQ
+}
 
-	// организуем клиента для отправки вычитанных из кафки сообщений на api сервиса
-	// по умолчанию порт хоста 8081 (доступ в браузере на localhost:8081)
-	port, ok := os.LookupEnv("L0_PORT")
-	if !ok {
-		port = "8081"
+// BatchInfo объединяет информацию об ответах api по сообщениям с самими сообщениями
+type BatchInfo struct {
+	respOfBatch  []OrderResponse           // ответы по каждому из сообщений батча
+	messageByUID map[string]*kafka.Message // мапа идентификации [orderUID]kafka.Message
+}
+
+// ConsumerConfig описывает настройки с учётом переменных окружения
+type ConsumerConfig struct {
+	Topic           string        // имя топика (коррелируется с продюсером)
+	GroupID         string        // имя группы
+	KafkaPort       int           // порт, на котором сидит kafka
+	LimitConsumWork time.Duration // время работы консумера в секундах
+	ServicePort     int           // порт принимающего api-сервиса
+	BatchSize       int           // количество сообщений в батче
+	BatchTimeout    time.Duration // время наполнения батча, мс
+	MaxRetries      int           // количество повторных попыток связи
+	RetryDelayBase  time.Duration // базовая задержка для попыток связи
+	ClientTimeout   time.Duration // таймаут для HTTP клиента
+	DlqTopic        string        // топик для DLQ
+	WorkersCount    int           // количество параллельных обработчиков в пайплайне
+}
+
+var cfg *ConsumerConfig
+
+// getEnvString проверяет наличие и корректность переменной окружения (строковое значение)
+func getEnvString(envVariable, defaultValue string) string {
+
+	value, ok := os.LookupEnv(envVariable)
+	if ok {
+		return value
 	}
 
-	apiURL := fmt.Sprintf("http://localhost:%s/order", port)
-	httpClient := &http.Client{}
+	return defaultValue
+}
+
+// getEnvInt проверяет наличие и корректность переменной окружения (числовое значение)
+func getEnvInt(envVariable string, defaultValue int) int {
+
+	value, ok := os.LookupEnv(envVariable)
+	if ok {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+		log.Printf("ошибка парсинга %s, используем значение по умолчанию: %d", envVariable, defaultValue)
+	}
+
+	return defaultValue
+}
+
+// readConfig уточняет конфигурацию с учётом переменных окружения,
+// проверяет переменные окружения и устанавливает параметры работы
+func readConfig() *ConsumerConfig {
+
+	return &ConsumerConfig{
+		Topic:           getEnvString("TOPIC_NAME_STR", topicNameConst),
+		GroupID:         getEnvString("GROUP_ID_NAME_STR", groupIDNameConst),
+		KafkaPort:       getEnvInt("KAFKA_PORT_NUM", kafkaPortConst),
+		LimitConsumWork: time.Duration(getEnvInt("TIME_LIMIT_CONSUMER_S", limitConsumWorkConst)) * time.Second,
+		ServicePort:     getEnvInt("SERVICE_PORT_NUM", servicePortConst),
+		BatchSize:       getEnvInt("BATCH_SIZE_NUM", batchSizeConst),
+		BatchTimeout:    time.Duration(getEnvInt("BATCH_TIMEOUT_MS", batchTimeoutMsConst)) * time.Millisecond,
+		MaxRetries:      getEnvInt("MAX_RETRIES_NUM", maxRetriesConst),
+		RetryDelayBase:  time.Duration(getEnvInt("RETRY_DELEY_BASE_MS", retryDelayBaseConst)) * time.Millisecond,
+		ClientTimeout:   time.Duration(getEnvInt("CLIENT_TIMEOUT_S", clientTimeoutConst)) * time.Second,
+		DlqTopic:        getEnvString("DLQ_TOPIC_NAME_STR", dlqTopicConst),
+		WorkersCount:    getEnvInt("WORKERS_COUNT", workersCountConst),
+	}
+}
+
+// consumer это основной код консумера
+func consumer(ctx context.Context, errCh chan<- error, endCh chan struct{}) {
+
+	// устанавливаем соединение с брокером для автосоздания DLQ
+	conn, err := kafka.DialLeader(context.Background(), "tcp", fmt.Sprintf("localhost:%d", cfg.KafkaPort), cfg.DlqTopic, 0)
+	if err != nil {
+		log.Printf("ошибка создания DLQ-топика кафки: %v\n", err)
+		errCh <- fmt.Errorf("ошибка создания DLQ-топика кафки: %v", err)
+		// разблокируем main() и выходим
+		close(errCh)
+		close(endCh)
+		return
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Ошибка при закрытии консумером соединения с кафкой: %v", err)
+		}
+	}()
+
+	// врайтер для DLQ
+	dlqWriter := &kafka.Writer{
+		Addr:  kafka.TCP(fmt.Sprintf("kafka:%d", cfg.KafkaPort)),
+		Topic: cfg.DlqTopic,
+	}
+	defer func() {
+		if err := dlqWriter.Close(); err != nil {
+			log.Printf("ошибка при закрытии dlqWriter в консумере: %v", err)
+		}
+	}()
 
 	// ридер из кафки
 	r := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  []string{"localhost:9092"},
-		Topic:    topic,
-		GroupID:  groupID,
-		MinBytes: 0,
-		MaxWait:  10 * time.Second,
+		Brokers:  []string{fmt.Sprintf("localhost:%d", cfg.KafkaPort)},
+		Topic:    cfg.Topic,
+		GroupID:  cfg.GroupID,
+		MinBytes: 10000,  // минимальный пакет 10 КБ (3-5 сообщений)
+		MaxBytes: 500000, // максимальный пакет батчей 500 КБ (ориентировочно 150-200 сообщений)
+		MaxWait:  cfg.BatchTimeout,
 	})
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			log.Printf("ошибка при закрытии ридера Kafka: %v", err)
+		}
+	}()
 
-	log.Printf("Консуюмер подписан на топик '%s' в группе '%s'\n", topic, groupID)
+	// клиент для отправки вычитанных из кафки сообщений на api сервиса
+	httpClient := &http.Client{
+		Timeout: cfg.ClientTimeout,
+	}
+
+	log.Printf("Консумер подписан на топик '%s' в группе '%s'.\n", r.Config().Topic, r.Config().GroupID)
+	log.Printf("DLQ writer консумера подписан на топик '%s'.\n", dlqWriter.Topic)
 	log.Println("Начинаем вычитывать !!!")
 
-	// смотрим что прислали
-	for ctx.Err() == nil {
+	// TODO поиграть с размером буферов исходя из ожидаемой пропускной способности пайплайна. Интересно: есть ли какая-то формула?
+	messages := make(chan *kafka.Message, cfg.BatchSize*cfg.WorkersCount*10)     // канал для входящих сообщений с большим буфером
+	batches := make(chan []*kafka.Message, cfg.WorkersCount*cfg.WorkersCount*10) // канал для передачи батчей
+	responses := make(chan *BatchInfo, cfg.WorkersCount*cfg.WorkersCount*10)     // канал передачи ответов по батчам и мап с сообщениями
 
-		m, err := r.ReadMessage(ctx)
+	// wgPipe для ожидания всех горутин конвейера
+	var wgPipe sync.WaitGroup
+
+	// 1. читаем сообщения из кафки
+	wgPipe.Add(1)
+	go readMsgOfKafka(ctx, r, messages, errCh, &wgPipe)
+
+	// 2. комплектуем батчи из прочитанных сообщений
+	wgPipe.Add(1)
+	go complectBatches(messages, batches, &wgPipe)
+
+	// 3. отправляем батчи с ретраем и получаем ответы api с информацией по каждому сообщению
+	wgPipe.Add(1)
+	go batchWorker(dlqWriter, httpClient, batches, responses, &wgPipe)
+
+	// 4. обрабатываем ответы api для каждого сообщения - коммитим или заполняем DLQ
+	wgPipe.Add(1)
+	go processBatchResponse(r, dlqWriter, responses, endCh, &wgPipe)
+
+	// ждём окончания обработки всех считанных readMsgOfKafka сообщений
+	wgPipe.Wait()
+
+	// close(errCh) уже выполнился  при выходе из readMsgOfKafka
+	// close(endCh) уже выполнился  при выходе из processBatchResponse
+}
+
+// readMsgOfKafka читает сообщения из кафки и наполняет канал messages
+func readMsgOfKafka(ctx context.Context, r *kafka.Reader, messages chan<- *kafka.Message, errCh chan<- error, wgPipe *sync.WaitGroup) {
+
+	defer wgPipe.Done()
+
+	defer func() {
+		// закрываем при выходе канал messages, чтобы по мере обработки
+		// сообщений из канала завершили работу последующие этапы обработки
+		close(messages)
+
+		// закрываем при выходе канал errCh, чтобы разблокировать main()
+		close(errCh)
+	}()
+
+	timeForReadMessage := 50 * time.Millisecond   // время блокировки r.ReadMessage на чтении сообщения
+	retryForReadMessage := 100 * time.Millisecond // пауза при не критических ошибках
+
+	inCounter := 0  // счётчик входящих сообщений для логирования
+	outCounter := 0 // счётчик отправленных в канал сообщений
+	for {
+		// объявляем контекст для ReadMessage
+		ctxReadMessage, cancelRM := context.WithTimeout(ctx, timeForReadMessage)
+
+		msg, err := r.ReadMessage(ctxReadMessage)
+		cancelRM()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
-				log.Println("Получен сигнал завершения работы консумера.")
-				break
+				log.Printf("readMsgOfKafka: считано из kafka %d сообщений, отправлено на батчирование %d сообщений.\n", inCounter, outCounter)
+				return // при выходе закрывается errCh и в main() снимается блокировка, конвейер продолжает обработку уже вычитанных сообщений
 			}
-			log.Printf("ошибка чтения из кафки: %v\n", err)
-			continue
-		}
-
-		// отправляем сообщения через HTTP POST на api приложения
-		resp, err := httpClient.Post(apiURL, "application/json", bytes.NewReader(m.Value))
-		if err != nil {
-			log.Printf("ошибка сети: %v", err)
-			continue
-		}
-
-		if 200 <= resp.StatusCode && resp.StatusCode < 300 || resp.StatusCode == http.StatusConflict { // статусы 2XX = ок и 409 = дубль
-			if err := r.CommitMessages(ctx, m); err != nil {
-				log.Printf("ошибка при коммите сообщения %s\n: %v", m.Key, err)
-			} else {
-				log.Printf("Сообщение успешно обработано и закоммичено: %s\n", m.Key)
+			if errors.Is(err, context.DeadlineExceeded) {
+				select {
+				// добавляем паузу при таймауте: вероятно, сообщений нет и грузить CPU нет смысла
+				case <-time.After(retryForReadMessage):
+					continue
+				case <-ctx.Done():
+					log.Printf("readMsgOfKafka: считано из kafka %d сообщений, отправлено на батчирование %d сообщений.\n", inCounter, outCounter)
+					return // при выходе закрывается errCh и в main() снимается блокировка, конвейер продолжает обработку уже вычитанных сообщений
+				}
 			}
-		} else {
-			log.Printf("Сообщение обработано, не закоммиченно, статус ответа: %v\n", resp.StatusCode) // статусы Bad
+			log.Printf("readMsgOfKafka: считано из kafka %d сообщений, отправлено на батчирование %d сообщений.\n", inCounter, outCounter)
+			errCh <- err // оповещаем main() и выходим, конвейер продолжает обработку уже вычитанных сообщений
+			return
 		}
 
-		resp.Body.Close() // закрываем тело запроса
+		inCounter++
 
+		select {
+		case messages <- &msg:
+			outCounter++
+		case <-ctx.Done():
+			log.Printf("readMsgOfKafka: считано из kafka %d сообщений, отправлено на батчирование %d сообщений.\n", inCounter, outCounter)
+			return // при выходе закрывается errCh и в main() снимается блокировка, конвейер продолжает обработку уже вычитанных сообщений
+		}
 	}
+}
+
+// complectBatches собирает батчи из сообщений из messages (по количеству или по времени) и наполняет канал batches,
+// контекст не используем в надежде обработать все уже поступившие сообщения из канала messages
+func complectBatches(messages <-chan *kafka.Message, batches chan<- []*kafka.Message, wgPipe *sync.WaitGroup) {
+
+	defer wgPipe.Done()
+
+	var wg sync.WaitGroup
+
+	log.Printf("complectBatches: запускаем %d воркеров сбора батчей.\n", cfg.WorkersCount)
+
+	// запускаем пул воркеров
+	for i := 0; i < cfg.WorkersCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			currentBatch := make([]*kafka.Message, 0, cfg.BatchSize) // батч с указателями на сообщения
+			ticker := time.NewTicker(cfg.BatchTimeout)               // таймер для отключения комплектования батча по времени
+			defer ticker.Stop()
+
+			inCounter := 0    // счётчик входящих сообщений для воркера
+			lenCounter := 0   // счётчик количества сообщений в отправленных батчах
+			batchCounter := 0 // счётчик количества отправленных батчей
+
+			sendBatch := func() {
+				copyBatch := make([]*kafka.Message, len(currentBatch))
+				copy(copyBatch, currentBatch)
+				batches <- copyBatch
+				currentBatch = currentBatch[:0:cfg.BatchSize]
+				lenCounter += len(copyBatch)
+				batchCounter++
+			}
+
+			for {
+				select {
+				// если прошло время, выделенное на сбор батча, отправляем что накопилось, и повторяем вычитывание
+				case <-ticker.C:
+					if len(currentBatch) > 0 {
+						sendBatch()
+					}
+					continue
+				// если можем считать сообщение и канал открыт, читаем сообщение и копим батч
+				case msg, ok := <-messages:
+					if !ok {
+						if len(currentBatch) > 0 {
+							sendBatch()
+						}
+						log.Printf("complectBatches: воркер %d получил %d сообщений, завершил работу, отправлено %d сообщений в %d батчах.\n", i, inCounter, lenCounter, batchCounter)
+						return // если канал закрыт и читать больше нечего, завершаем работу
+					}
+					inCounter++
+					currentBatch = append(currentBatch, msg)
+					// если достигли нужного размера сразу отправляем
+					if len(currentBatch) >= cfg.BatchSize {
+						sendBatch()
+					}
+				}
+			}
+		}(i)
+	}
+
+	// по завершению воркеров закрываем канал, чтобы по мере обработки сообщений
+	// из канала завершили работу последующие этапы обработки
+	go func() {
+		wg.Wait()
+		close(batches)
+		log.Println("complectBatches: все воркеры завершены, канал batches закрыт.")
+	}()
+}
+
+// batchWorker получает батчи и направляет в api, ответы передаёт далее на обработку в канал responses
+func batchWorker(dlqWriter *kafka.Writer, httpClient *http.Client, batches <-chan []*kafka.Message,
+	responses chan<- *BatchInfo, wgPipe *sync.WaitGroup) {
+
+	defer wgPipe.Done()
+
+	log.Printf("batchWorker: запускаем %d воркеров отправки батчей в api.\n", cfg.WorkersCount)
+
+	var wg sync.WaitGroup
+
+	// запускаем пул воркеров
+	for i := 0; i < cfg.WorkersCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			batchCounter := 0   // счётчик пришедших батчей
+			lenBatches := 0     // счётчик обработанных сообщений
+			counterDLQ := 0     // количество сообщений, отправленных в DLQ
+			respCounter := 0    // количество ответов по запросам
+			counterRespMsg := 0 // количество ответов по сообщениям (если всё ок, то counterResp = counterDLQ + lenBatches)
+
+			// слушаем канал с группами сообщений
+			for batch := range batches {
+
+				// нулевых батчей приходить не должно, но на всякий случай проверяем
+				if len(batch) == 0 {
+					log.Printf("batchWorker: воркер %d: следующим после батча: %d пришёл батч с нулевой длинной.", i, batchCounter)
+					continue
+				}
+
+				batchCounter++
+				lenBatches += len(batch)
+
+				// 1. подготавливаем данные для API
+
+				var jsonMessages []json.RawMessage
+				messageMap := make(map[string]*kafka.Message) // [orderUID]->*message
+
+				for _, msg := range batch {
+					// извлекаем orderUID для маппинга
+					if orderUID := extractOrderUID(msg.Value); orderUID != "" {
+						messageMap[orderUID] = msg
+						jsonMessages = append(jsonMessages, msg.Value)
+					} else {
+						// при отсутствии идентификатора сообщение шлём в DLQ
+						counterDLQ++
+						sendToDLQ(dlqWriter, msg, "not exist OrderUID")
+					}
+				}
+
+				// 2. отправляем батч с повторами
+
+				// полученный ответ это []OrderResponse, в котором orderUID-ы это ключи для мапы [orderUID]->message
+				response, err := sendBatchWithRetry(httpClient, jsonMessages)
+				if err != nil {
+					log.Printf("batchWorker: воркер %d: ошибка отправки батча: %v", i, err)
+					// при критической ошибке отправляем все в DLQ и идём за новой порцией сообщений
+					for _, msg := range batch {
+						counterDLQ++
+						sendToDLQ(dlqWriter, msg, err.Error())
+					}
+					continue
+				}
+
+				respCounter++
+				counterRespMsg += len(response)
+
+				// 3. объединяем ответ по батчу и мапу [orderUID]->message в структуру
+				//    и шлём в канал для обработки в processBatchResponse
+
+				batchInfo := &BatchInfo{
+					respOfBatch:  response,
+					messageByUID: messageMap,
+				}
+				responses <- batchInfo
+			}
+
+			log.Printf("batchWorker: воркер %d: обработано %d батчей, из %d сообщений, ответов api на запросы %d, ответов api для %d сообщений, сообщений в DLQ %d.\n",
+				i, batchCounter, lenBatches, respCounter, counterRespMsg, counterDLQ)
+		}(i)
+	}
+
+	// по завершению воркеров закрываем канал, чтобы по мере обработки сообщений
+	// из канала завершили работу последующие этапы обработки
+	go func() {
+		wg.Wait()
+		close(responses)
+		log.Println("batchWorker: все воркеры завершены, канал responses закрыт.")
+	}()
+}
+
+// extractOrderUID вытаскивает OrderUID из msg.Value,
+// для последующей идентификации msg
+func extractOrderUID(data []byte) string {
+
+	var msgIdentificator struct {
+		OrderUID string `json:"order_uid"`
+	}
+	if err := json.Unmarshal(data, &msgIdentificator); err == nil {
+		return msgIdentificator.OrderUID
+	}
+	// если по какому-то чудесному стечению обстоятельств OrderUID отсутствует
+	// в информации о заказе, то такое сообщение годится только для DLQ
+	return ""
+}
+
+// sendToDLQ уточняет заголовок сообщения и отправляет его в DLQ
+func sendToDLQ(w *kafka.Writer, msg *kafka.Message, reason string) {
+
+	if msg == nil {
+		log.Println("sendToDLQ: передан nil указатель на сообщение")
+		return
+	}
+
+	keyStr := string(msg.Key)
+	if msg.Key == nil {
+		keyStr = "<nil-key>"
+	}
+
+	dlqMsg := kafka.Message{
+		Key:   []byte(fmt.Sprintf("dlq-%s", keyStr)),
+		Value: msg.Value,
+		Headers: []kafka.Header{
+			{Key: "original-topic", Value: []byte(msg.Topic)},
+			{Key: "original-partition", Value: []byte(fmt.Sprintf("%d", msg.Partition))},
+			{Key: "original-offset", Value: []byte(fmt.Sprintf("%d", msg.Offset))},
+			{Key: "error-reason", Value: []byte(reason)},
+			{Key: "timestamp", Value: []byte(time.Now().Format(time.RFC3339))},
+		},
+	}
+
+	// используем пустой контекст с целью обработать все сообщения, которые вычитал ридер в readMsgOfKafka
+	if err := w.WriteMessages(context.Background(), dlqMsg); err != nil {
+		log.Printf("ошибка отправки сообщения %s в DLQ: %v", keyStr, err)
+	}
+}
+
+// sendBatchWithRetry передает сообщение в API с повторами и получет []OrderResponse в ответ
+func sendBatchWithRetry(client *http.Client, data []json.RawMessage) ([]OrderResponse, error) {
+
+	// определяем адрес отправки
+	apiURL := fmt.Sprintf("http://localhost:%d/order", cfg.ServicePort)
+
+	// формируем тело запроса
+	requestBody, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка сериализации: %w", err)
+	}
+
+	for attempt := 1; attempt <= cfg.MaxRetries; attempt++ {
+
+		// направляем запрос
+		resp, err := client.Post(apiURL, "application/json", bytes.NewReader(requestBody))
+		if err != nil {
+			log.Printf("Ошибка сети (попытка %d/%d): %v", attempt, cfg.MaxRetries, err)
+
+			// проверяем номер попытки и делаем паузу перед следующей попыткой
+			if attempt < cfg.MaxRetries {
+
+				// делаем увеличивающуюся паузу (200ms, 600ms, 1200ms)
+				delay := cfg.RetryDelayBase * time.Duration(attempt*attempt+attempt) * time.Millisecond
+				time.Sleep(delay)
+			}
+			continue
+		}
+
+		// читаем тело ответа
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Ошибка чтения ответа (попытка %d/%d): %v", attempt, cfg.MaxRetries, err)
+			continue
+		}
+
+		// проверяем код ответа и парсим ответ
+		if resp.StatusCode == http.StatusMultiStatus || resp.StatusCode == http.StatusCreated {
+			var responses []OrderResponse
+			if err := json.Unmarshal(body, &responses); err != nil {
+				return nil, fmt.Errorf("ошибка декодирования ответа: %w", err)
+			}
+			return responses, nil
+		}
+
+		// если статус не 201 или 207, пробуем снова
+		log.Printf("Попытка %d/%d: неожиданный статус %d", attempt, cfg.MaxRetries, resp.StatusCode)
+	}
+
+	return nil, fmt.Errorf("не удалось отправить запрос после %d попыток", cfg.MaxRetries)
+}
+
+// processBatchResponse обрабатывает полученные от api ответы по каждому сообщению из батча
+func processBatchResponse(r *kafka.Reader, dlqWriter *kafka.Writer, responses <-chan *BatchInfo, endCh chan struct{}, wgPipe *sync.WaitGroup) {
+
+	defer wgPipe.Done()
+
+	log.Printf("processBatchResponse: запускаем %d воркеров обработки ответов api.\n", cfg.WorkersCount)
+
+	var wg sync.WaitGroup
+
+	// запускаем пул воркеров
+	for i := 0; i < cfg.WorkersCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			batchApi := 0     // счётчик поступивших ответов от api
+			msgApiAnswer := 0 // количество сообщений, на которые api дало ответ
+			toCommit := 0     // счётчик закоммиченых воркером сообщений
+			toDLQ := 0        // счётчик сообщений, отправленных в DLQ
+
+			// слушаем канал с информацией об ответах api, пока канал открыт
+			for batchInfo := range responses {
+
+				batchApi++
+				msgApiAnswer += len(batchInfo.respOfBatch)
+
+				// для обработки ответа по каждому сообщению смотрим есть ли
+				// сообщение в мапе и можно ли его закоммитить
+				for _, resp := range batchInfo.respOfBatch {
+
+					msg, ok := batchInfo.messageByUID[resp.OrderUID]
+					if !ok {
+						// не смотря на такое невероятное стечение обстоятельств, чтобы не останавливать конвейер, логируем и продолжаем
+						log.Printf("processBatchResponse: воркер %d: в мапе заказов не оказалось сообщения с OrderUID = %s !!!\n", i, resp.OrderUID)
+						continue
+					}
+
+					switch {
+					case resp.ShouldCommit:
+						if err := r.CommitMessages(context.Background(), *msg); err != nil {
+							log.Printf("processBatchResponse: воркер %d: ошибка коммита сообщения %s: %v", i, string(msg.Key), err)
+						} else {
+							toCommit++
+						}
+					case resp.ShouldDLQ:
+						sendToDLQ(dlqWriter, msg, resp.Message)
+						toDLQ++
+					default:
+						log.Printf("processBatchResponse: воркер %d: в структуре ответа по сообщению с OrderUID = %s не хватает информации!!!\n", i, resp.OrderUID)
+					}
+				}
+			}
+
+			log.Printf("processBatchResponse: воркер %d: от api поступило ответов %d для %d сообщений, закоммичено: %d, отправлено в DLQ: %d.",
+				i, batchApi, msgApiAnswer, toCommit, toDLQ)
+		}(i)
+	}
+
+	// ждём завершения воркеров
+	go func() {
+		wg.Wait()
+		log.Println("processBatchResponse: все воркеры завершены.")
+		close(endCh)
+	}()
 }
 
 func main() {
 
-	// определяем время работы консумера
-	limitStr, ok := os.LookupEnv("TIME_LIMIT_CONSUMER_L0")
-	if !ok {
-		limitStr = "10800"
-	}
-
-	timeLimitConsumer, err := strconv.Atoi(limitStr)
-	if err != nil {
-		log.Printf("проверьте .env файл, ошибка назначения времени работы консумера: %v\n", err)
-		log.Println("Время работы консумера принимается 3 часа.")
-		timeLimitConsumer = 10800
-	}
+	// считываем конфигурацию
+	cfg = readConfig()
 
 	// заведём контекст для отмены работы консумера
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.LimitConsumWork)
 	defer cancel()
 
-	// через определённое время завершаем работу консумера
+	// обработка сигналов ОС для graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// канал для передачи ошибки ридера при чтении сообщений из кафки
+	errCh := make(chan error)
+
+	// канал для передачи сигнала об окончании обработки сообщений
+	endCh := make(chan struct{})
+
+	// ждём сигнал отмены в фоне
 	go func() {
-		<-time.After(time.Duration(timeLimitConsumer) * time.Second)
+		<-sigChan
+		log.Println("Получен сигнал остановки, завершаем работу...")
 		cancel()
 	}()
 
 	// запускаем основной код консумера
-	consumer(ctx)
+	consumer(ctx, errCh, endCh)
 
-	log.Println("Консумер завершил работу.")
+	// ждём получения ошибки или nil из логики конвейера
+	// ошибки: нет возможности читать сообщения из брокера или нет возможности заполнять DLQ
+	err := <-errCh
+	if err != nil {
+		log.Printf("консумер завершился с критической ошибкой: %v", err)
+		cancel()
+	}
+
+	<-endCh // завершился последний воркер в конвейере обработки
+
+	log.Println("Консумер корректно завершил работу.")
 }

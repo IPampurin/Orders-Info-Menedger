@@ -10,12 +10,19 @@ import (
 	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/cache"
 	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/db"
 	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/models"
+	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/shutdown"
 	"github.com/go-chi/chi/v5"
 	"gorm.io/gorm"
 )
 
 // GetOrderByID выдаёт данные о заказе по order_uid
 func GetOrderByID(w http.ResponseWriter, r *http.Request) {
+
+	// проверяем не останавливается ли сервер
+	if shutdown.IsShuttingDown() {
+		http.Error(w, "Сервер находится в процессе остановки. Операция невозможна.", http.StatusServiceUnavailable)
+		return
+	}
 
 	// получаем OrderUID из параметров запроса
 	orderUID := chi.URLParam(r, "order_uid")
@@ -39,7 +46,9 @@ func GetOrderByID(w http.ResponseWriter, r *http.Request) {
 		if err = json.Unmarshal(jsonData, &order); err != nil {
 			log.Printf("Битые данные в кэше: %s. Удаляем ключ.", cacheKey)
 			// убираем мусор
-			cache.DelCache(cacheKey)
+			if err := cache.DelCache(cacheKey); err != nil {
+				log.Printf("Ошибка удаления битых данных из кэша %s: %v", cacheKey, err)
+			}
 		} else {
 			// если данные корректные
 			// маршалим даные в JSON с отступами для читаемости
@@ -69,7 +78,7 @@ func GetOrderByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// если заказ в базе есть и штатно получен, то записываем заказ в кэш
-		if err := cache.SetCahe(cacheKey, order, cache.GetTTL()); err != nil {
+		if err := cache.SetCache(cacheKey, order); err != nil {
 			log.Printf("Ошибка кэширования при запросе по uid: %v", err)
 		}
 

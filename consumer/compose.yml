@@ -8,8 +8,6 @@ services:
     env_file:
       - .env
     image: my-consumer  
-    working_dir: /usr/src/app
-    command: go run main.go
-    volumes:
-      - ./:/usr/src/app
+    command: ["./consumer"]
     network_mode: "host"
+    stop_grace_period: 45s

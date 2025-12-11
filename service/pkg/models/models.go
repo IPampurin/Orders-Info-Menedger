@@ -2,71 +2,77 @@ package models
 
 import (
 	"time"
-
-	"gorm.io/gorm"
 )
 
 // Заказ
 type Order struct {
-	gorm.Model
-	OrderUID          string    `json:"order_uid" gorm:"unique_index;not null"`
-	TrackNumber       string    `json:"track_number" gorm:"index"`
-	Entry             string    `json:"entry"`
-	Delivery          Delivery  `json:"delivery" gorm:"foreignKey:OrderID"`
-	Payment           Payment   `json:"payment" gorm:"foreignKey:OrderID"`
-	Items             []Item    `json:"items" gorm:"foreignKey:OrderID"`
-	Locale            string    `json:"locale"`
+	ID                uint `gorm:"primaryKey"`
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	OrderUID          string    `json:"order_uid" validate:"required"`
+	TrackNumber       string    `json:"track_number" validate:"required"`
+	Entry             string    `json:"entry" validate:"required"`
+	Delivery          Delivery  `json:"delivery" gorm:"foreignKey:OrderID" validate:"required"`
+	Payment           Payment   `json:"payment" gorm:"foreignKey:OrderID" validate:"required"`
+	Items             []Item    `json:"items" gorm:"foreignKey:OrderID" validate:"required,min=1,dive"`
+	Locale            string    `json:"locale" validate:"required"`
 	InternalSignature string    `json:"internal_signature"`
-	CustomerID        string    `json:"customer_id"`
-	DeliveryService   string    `json:"delivery_service"`
-	Shardkey          string    `json:"shardkey"`
-	SMID              int       `json:"sm_id" gorm:"type:smallint"`
-	DateCreated       time.Time `json:"date_created" gorm:"type:timestamp;default:CURRENT_TIMESTAMP"`
+	CustomerID        string    `json:"customer_id" validate:"required"`
+	DeliveryService   string    `json:"delivery_service" validate:"required"`
+	Shardkey          string    `json:"shardkey" validate:"required"`
+	SMID              int       `json:"sm_id" validate:"required,min=1"`
+	DateCreated       time.Time `json:"date_created"`
 	OOFShard          string    `json:"oof_shard"`
 }
 
 // Доставка
 type Delivery struct {
-	gorm.Model
-	OrderID uint   `json:"-"`
-	Name    string `json:"name" gorm:"size:100"`
-	Phone   string `json:"phone" gorm:"size:20"`
-	Zip     string `json:"zip" gorm:"size:20"`
-	City    string `json:"city" gorm:"size:100"`
-	Address string `json:"address" gorm:"size:255"`
-	Region  string `json:"region" gorm:"size:100"`
-	Email   string `json:"email" gorm:"unique_index;type:varchar(100)"`
+	ID        uint `gorm:"primaryKey"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	OrderID   uint   `json:"-"`
+	Name      string `json:"name" validate:"required"`
+	Phone     string `json:"phone" validate:"required"`
+	Zip       string `json:"zip" validate:"required"`
+	City      string `json:"city" validate:"required"`
+	Address   string `json:"address" validate:"required"`
+	Region    string `json:"region" validate:"required"`
+	Email     string `json:"email" validate:"required,email"`
 }
 
 // Оплата
 type Payment struct {
-	gorm.Model
+	ID           uint `gorm:"primaryKey"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 	OrderID      uint    `json:"-"`
-	Transaction  string  `json:"transaction" gorm:"unique_index"`
+	Transaction  string  `json:"transaction" validate:"required"`
 	RequestID    string  `json:"request_id"`
-	Currency     string  `json:"currency" gorm:"size:3"`
-	Provider     string  `json:"provider" gorm:"size:50"`
-	Amount       float64 `json:"amount" gorm:"type:decimal(10,2)"`
-	PaymentDT    int64   `json:"payment_dt" gorm:"type:bigint"`
-	Bank         string  `json:"bank" gorm:"size:50"`
-	DeliveryCost float64 `json:"delivery_cost" gorm:"type:decimal(10,2)"`
-	GoodsTotal   float64 `json:"goods_total" gorm:"type:decimal(10,2)"`
-	CustomFee    float64 `json:"custom_fee" gorm:"type:decimal(10,2)"`
+	Currency     string  `json:"currency" validate:"required"`
+	Provider     string  `json:"provider" validate:"required"`
+	Amount       float64 `json:"amount" validate:"required,min=0"`
+	PaymentDT    int64   `json:"payment_dt" validate:"required,min=1"`
+	Bank         string  `json:"bank" validate:"required"`
+	DeliveryCost float64 `json:"delivery_cost" validate:"min=0"`
+	GoodsTotal   float64 `json:"goods_total" validate:"min=0"`
+	CustomFee    float64 `json:"custom_fee" validate:"min=0"`
 }
 
 // Позиция заказа
 type Item struct {
-	gorm.Model
+	ID          uint `gorm:"primaryKey"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 	OrderID     uint    `json:"-"`
-	ChrtID      int     `json:"chrt_id" gorm:"type:integer"`
+	ChrtID      int     `json:"chrt_id" validate:"required,min=1"`
 	TrackNumber string  `json:"track_number"`
-	Price       float64 `json:"price" gorm:"type:decimal(10,2)"`
-	RID         string  `json:"rid" gorm:"size:100"`
-	Name        string  `json:"name" gorm:"size:255"`
-	Sale        float64 `json:"sale" gorm:"type:decimal(5,2)"`
-	Size        string  `json:"size" gorm:"size:20"`
-	TotalPrice  float64 `json:"total_price" gorm:"type:decimal(10,2)"`
-	NMID        int     `json:"nm_id" gorm:"type:integer"`
-	Brand       string  `json:"brand" gorm:"size:100"`
-	Status      int     `json:"status" gorm:"type:smallint"`
+	Price       float64 `json:"price" validate:"required,min=0"`
+	RID         string  `json:"rid" validate:"required"`
+	Name        string  `json:"name" validate:"required"`
+	Sale        float64 `json:"sale" validate:"min=0,max=100"`
+	Size        string  `json:"size" validate:"required"`
+	TotalPrice  float64 `json:"total_price" validate:"required,min=0"`
+	NMID        int     `json:"nm_id" validate:"required,min=1"`
+	Brand       string  `json:"brand" validate:"required"`
+	Status      int     `json:"status" validate:"required,min=0"`
 }
