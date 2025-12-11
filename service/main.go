@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/cache"
-	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/db"
-	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/server"
+	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/cache"
+	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/db"
+	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/server"
 )
 
 func main() {
