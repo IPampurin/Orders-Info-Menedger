@@ -17,15 +17,17 @@ import (
 
 // выносим константы конфигурации по умолчанию, чтобы были на виду
 const (
-	redisPortConst     = "6379" // порт, на котором сидит рэдис по умолчанию
-	redisPasswordConst = ""     // пароль от БД рэдиса по умолчанию
-	redisDBNumberConst = 0      // номер БД рэдиса по умолчанию
-	redisTTLConst      = 600    // время жизни данных в кэше в секундах по умолчанию
-	thresholdConst     = 24     // время в часах за которое берём записи для прогрева кэша по умолчанию
+	redisHostConst     = "redis" // имя службы (контейнера) в сети докера по умолчанию
+	redisPortConst     = "6379"  // порт, на котором сидит рэдис по умолчанию
+	redisPasswordConst = ""      // пароль от БД рэдиса по умолчанию
+	redisDBNumberConst = 0       // номер БД рэдиса по умолчанию
+	redisTTLConst      = 600     // время жизни данных в кэше в секундах по умолчанию
+	thresholdConst     = 24      // время в часах за которое берём записи для прогрева кэша по умолчанию
 )
 
 // CacheConfig описывает настройки с учётом переменных окружения
 type CacheConfig struct {
+	RedisHost     string        // имя службы (контейнера) в сети докера
 	RedisPort     string        // порт, на котором сидит рэдис
 	RedisPassword string        // пароль от БД рэдиса
 	RedisDBNumber int           // номер БД рэдиса
@@ -34,8 +36,8 @@ type CacheConfig struct {
 }
 
 var (
-	Rdb *redis.Client
-	cfg *CacheConfig
+	Rdb      *redis.Client
+	cfgCache *CacheConfig
 )
 
 // getEnvString проверяет наличие и корректность переменной окружения (строковое значение)
@@ -67,6 +69,7 @@ func getEnvInt(envVariable string, defaultValue int) int {
 func readConfig() *CacheConfig {
 
 	return &CacheConfig{
+		RedisHost:     getEnvString("REDIS_HOST_NAME", redisHostConst),
 		RedisPort:     getEnvString("REDIS_PORT", redisPortConst),
 		RedisPassword: getEnvString("REDIS_PASSWORD", redisPasswordConst),
 		RedisDBNumber: getEnvInt("REDIS_DB", redisDBNumberConst),
@@ -79,27 +82,27 @@ func readConfig() *CacheConfig {
 func InitRedis() error {
 
 	// считываем конфигурацию
-	cfg = readConfig()
+	cfgCache = readConfig()
 
 	// проверяем номер базы в рэдисе
-	if cfg.RedisDBNumber < 0 || 16 < cfg.RedisDBNumber {
-		log.Printf("Проверьте .env файл, ошибка назначения базы данных Redis. Ожидается значение: 0 ... 16. Получено: %d\n", cfg.RedisDBNumber)
+	if cfgCache.RedisDBNumber < 0 || 16 < cfgCache.RedisDBNumber {
+		log.Printf("Проверьте .env файл, ошибка назначения базы данных Redis. Ожидается значение: 0 ... 16. Получено: %d\n", cfgCache.RedisDBNumber)
 		log.Printf("Используется значение по умолчанию: %d\n", redisDBNumberConst)
-		cfg.RedisDBNumber = redisDBNumberConst
+		cfgCache.RedisDBNumber = redisDBNumberConst
 	}
 
 	// проверяем время жизни данных в кэше
-	if cfg.RedisTTL < 0 {
-		log.Printf("Проверьте .env файл, ошибка назначения TTL для Redis. Ожидается положительное значение. Получено: %d\n", cfg.RedisTTL)
+	if cfgCache.RedisTTL < 0 {
+		log.Printf("Проверьте .env файл, ошибка назначения TTL для Redis. Ожидается положительное значение. Получено: %d\n", cfgCache.RedisTTL)
 		log.Printf("Используется значение по умолчанию: %dс.\n", redisTTLConst)
-		cfg.RedisTTL = time.Duration(redisTTLConst) * time.Second
+		cfgCache.RedisTTL = time.Duration(redisTTLConst) * time.Second
 	}
 
 	// заводим клиента Redis
 	Rdb = redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%s", "redis", cfg.RedisPort),
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDBNumber,
+		Addr:     fmt.Sprintf("%s:%s", cfgCache.RedisHost, cfgCache.RedisPort),
+		Password: cfgCache.RedisPassword,
+		DB:       cfgCache.RedisDBNumber,
 	})
 
 	log.Println("Клиент Redis запущен.")
@@ -128,18 +131,18 @@ func InitRedis() error {
 // GetTTL определяет время жизни данных в кэше (для postOrder понадобится)
 func GetTTL() time.Duration {
 
-	if cfg == nil {
+	if cfgCache == nil {
 		// если конфиг еще не инициализирован, возвращаем значение по умолчанию
 		return time.Duration(redisTTLConst) * time.Second
 	}
-	return cfg.RedisTTL
+	return cfgCache.RedisTTL
 }
 
 // loadDataToCache загружает данные за последнее время в кэш при старте
 func loadDataToCache() error {
 
 	// устанавливаем временной порог (например, 24 часа)
-	timeThreshold := time.Now().Add(-cfg.RedisWarming)
+	timeThreshold := time.Now().Add(-cfgCache.RedisWarming)
 
 	// получаем заказы до установленного порога
 	var orders []models.Order
@@ -153,7 +156,7 @@ func loadDataToCache() error {
 		return fmt.Errorf("ошибка при получении заказов: %v", err)
 	}
 
-	hours := cfg.RedisWarming.Hours()
+	hours := cfgCache.RedisWarming.Hours()
 	log.Printf("Найдено %d заказов за последние %.0f часа", len(orders), hours)
 
 	// сохраняем данные в redis
