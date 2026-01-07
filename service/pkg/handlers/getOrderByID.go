@@ -7,10 +7,10 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/cache"
-	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/db"
-	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/models"
-	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/shutdown"
+	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/cache"
+	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/db"
+	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/models"
+	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/shutdown"
 	"github.com/go-chi/chi/v5"
 	"gorm.io/gorm"
 )

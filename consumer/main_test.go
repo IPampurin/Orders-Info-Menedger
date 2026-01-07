@@ -886,7 +886,7 @@ func runTestConsumer(brokerAddr, topic, groupID, dlqTopic string) {
 	// Каналы
 	messages := make(chan *kafka.Message, cfg.BatchSize*cfg.WorkersCount*10)
 	batches := make(chan []*kafka.Message, cfg.WorkersCount*cfg.WorkersCount*10)
-	responses := make(chan *BatchInfo, cfg.WorkersCount*cfg.WorkersCount*10)
+	responses := make(chan *RespBatchInfo, cfg.WorkersCount*cfg.WorkersCount*10)
 	endCh := make(chan struct{})
 	errCh := make(chan error)
 
@@ -906,7 +906,7 @@ func runTestConsumer(brokerAddr, topic, groupID, dlqTopic string) {
 	// 3. отправляем батчи в API
 	wgPipe.Add(1)
 	//defer wgPipe.Done()
-	go batchWorker(dlqWriter, httpClient, batches, responses, &wgPipe)
+	go batchPrepareCollect(dlqWriter, httpClient, batches, responses, &wgPipe)
 
 	// 4. обрабатываем ответы
 	wgPipe.Add(1)

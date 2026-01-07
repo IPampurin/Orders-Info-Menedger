@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IPampurin/Orders-Info-Menedger/service/pkg/models"
+	"github.com/IPampurin/WB-technical-schools/L0/service/pkg/models"
 	"github.com/stretchr/testify/assert"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"

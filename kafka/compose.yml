@@ -1,7 +1,8 @@
-version: '3'
+version: '3.9'
+
 services:
   kafka:
-    image: apache/kafka:latest
+    image: apache/kafka:4.1.1
     container_name: ${KAFKA_HOST_NAME:-kafka}
     env_file:
       - .env
@@ -27,4 +28,4 @@ services:
 
 networks:
   frontend:
-    driver: bridge  # Создаём внешнюю сеть, в которой объдиним контейнеры
+    driver: bridge  # Создаём внешнюю сеть, в которой объединим контейнеры
